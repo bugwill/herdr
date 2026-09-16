@@ -17,6 +17,10 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn transfer_source(&self) -> crate::terminal_transfer::TransferSource {
+        self.0.transfer_source()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

@@ -52,6 +52,9 @@ pub struct EndpointClientHello {
     /// Accept the optional surface-delta encoding on this connection.
     #[serde(default)]
     pub surface_delta: bool,
+    /// Advertise support for routing Kitty OSC 5113 transfer responses.
+    #[serde(default)]
+    pub terminal_transfer: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -191,6 +194,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            terminal_transfer: false,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],

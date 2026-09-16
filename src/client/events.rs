@@ -5,6 +5,8 @@ pub(super) enum ClientLoopEvent {
     #[cfg(unix)]
     StdinInput(Vec<u8>),
     #[cfg(unix)]
+    TerminalTransferResponse(Vec<u8>),
+    #[cfg(unix)]
     PixelMouse(Vec<u8>, crate::input::mouse::HostGeometry),
     #[cfg(unix)]
     DirectGraphicsResponse(direct_graphics::Response),

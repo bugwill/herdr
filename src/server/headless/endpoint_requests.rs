@@ -35,6 +35,33 @@ impl HeadlessServer {
             self.send_to_client(client_id, message);
             return false;
         }
+        if let api::schema::Method::TerminalTransfer(params) = &request.method {
+            if !client.terminal_transfer {
+                self.send_to_client(
+                    client_id,
+                    crate::server::client_commands::error_message(
+                        boot_id,
+                        request_id,
+                        "unsupported_endpoint_command",
+                        "this endpoint does not support terminal transfers",
+                    ),
+                );
+                return false;
+            }
+            let result = self.handle_terminal_transfer_request(client_id, params.operation.clone());
+            let message = match result {
+                Ok(()) => crate::server::client_commands::success_message_with_result(
+                    boot_id,
+                    request_id,
+                    api::schema::ResponseResult::Ok {},
+                ),
+                Err((code, reason)) => {
+                    crate::server::client_commands::error_message(boot_id, request_id, code, reason)
+                }
+            };
+            self.send_to_client(client_id, message);
+            return false;
+        }
         let surface_active = client.shell_surface_active;
         if let api::schema::Method::ClientShellSurfaceSet(params) = &request.method {
             let Some((changed, projection_revision)) =

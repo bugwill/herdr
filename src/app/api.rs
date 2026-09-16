@@ -102,7 +102,9 @@ impl App {
         };
         if matches!(
             &ev,
-            AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
+            AppEvent::TerminalBell { .. }
+                | AppEvent::ClipboardWrite { .. }
+                | AppEvent::TerminalTransfer { .. }
         ) {
             return Vec::new();
         }
@@ -1002,6 +1004,13 @@ impl App {
                         changed: false,
                         reason: crate::api::schema::ClientWindowTitleReason::NoForegroundClient,
                     },
+                );
+            }
+            Method::TerminalTransfer(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "client_required",
+                    "terminal.transfer requires a client shell connection",
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),

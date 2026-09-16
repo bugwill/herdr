@@ -1813,6 +1813,34 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+fn publish_terminal_transfers(
+    pane_id: PaneId,
+    source: &Arc<AtomicU32>,
+    commands: Vec<Vec<u8>>,
+    events: &mpsc::Sender<AppEvent>,
+    responses: &mut Vec<Bytes>,
+) {
+    for command in commands {
+        // The PTY actor also services input and shutdown. Blocking it on the main
+        // loop can deadlock pane teardown, so congestion aborts the transfer.
+        if let Err(error) = events.try_send(AppEvent::TerminalTransfer {
+            pane_id,
+            source: crate::terminal_transfer::TransferSource::new(source),
+            command,
+        }) {
+            let AppEvent::TerminalTransfer { command, .. } = error.into_inner() else {
+                continue;
+            };
+            if let Some((_, id)) = crate::terminal_transfer::parse_action_and_id(&command) {
+                responses.push(Bytes::from(crate::terminal_transfer::encode_failure(
+                    &id,
+                    "EIO:terminal transfer event queue is full",
+                )));
+            }
+        }
+    }
+}
+
 fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<AppEvent>) {
     if count == 0 {
         return;
@@ -2196,6 +2224,7 @@ impl PaneRuntime {
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
+            let transfer_events = events.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2203,10 +2232,17 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
+                let mut result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                publish_terminal_transfers(
+                    pane_id,
+                    &child_pid,
+                    result.transfer_commands,
+                    &transfer_events,
+                    &mut result.terminal_responses,
+                );
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
@@ -2390,6 +2426,7 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let transfer_events = events.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2397,10 +2434,17 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let result =
+                let mut result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
+                publish_terminal_transfers(
+                    pane_id,
+                    &child_pid,
+                    result.transfer_commands,
+                    &transfer_events,
+                    &mut result.terminal_responses,
+                );
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
@@ -3219,6 +3263,10 @@ impl PaneRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn transfer_source(&self) -> crate::terminal_transfer::TransferSource {
+        crate::terminal_transfer::TransferSource::new(&self.child_pid)
     }
 
     pub fn queue_user_input_submission(
@@ -5278,5 +5326,32 @@ mod tests {
                 observed_at: _,
             } if delivered_pane == pane_id
         ));
+    }
+
+    #[test]
+    fn terminal_transfer_event_backpressure_never_blocks_the_pty_actor() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let pane_id = PaneId::from_raw(1);
+        tx.try_send(AppEvent::TerminalBell { pane_id, count: 1 })
+            .unwrap();
+        let mut responses = Vec::new();
+        publish_terminal_transfers(
+            pane_id,
+            &Arc::new(AtomicU32::new(0)),
+            vec![b"\x1b]5113;ac=send;id=busy\x07".to_vec()],
+            &tx,
+            &mut responses,
+        );
+        assert_eq!(responses.len(), 1);
+        assert!(crate::terminal_transfer::terminal_response(
+            &responses[0],
+            "busy"
+        ));
+        assert!(crate::terminal_transfer::session_error(&responses[0]));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::TerminalBell { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -351,6 +351,14 @@ impl HeadlessServer {
                 self.send_to_foreground_client(ServerMessage::Clipboard { data });
                 false
             }
+            AppEvent::TerminalTransfer {
+                pane_id,
+                source,
+                command,
+            } => {
+                self.forward_terminal_transfer(*pane_id, source.clone(), command);
+                false
+            }
             AppEvent::StateChanged { pane_id, agent, .. } => {
                 // Capture toast before handling.
                 let toast_before = self.app.state.toast.clone();

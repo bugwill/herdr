@@ -170,6 +170,7 @@ pub(crate) struct ProcessBytesResult {
     pub clipboard_writes: Vec<Vec<u8>>,
     pub reported_cwd: Option<std::path::PathBuf>,
     pub terminal_responses: Vec<Bytes>,
+    pub transfer_commands: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -189,6 +190,7 @@ pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
+    transfer_scanner: Mutex<crate::terminal_transfer::TransferScanner>,
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -1184,6 +1186,7 @@ impl GhosttyPaneTerminal {
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
+            transfer_scanner: Mutex::new(crate::terminal_transfer::TransferScanner::default()),
         })
     }
 
@@ -1335,6 +1338,17 @@ impl GhosttyPaneTerminal {
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
+        let transfer_commands = self
+            .transfer_scanner
+            .lock()
+            .map(|mut scanner| {
+                scanner
+                    .push(bytes)
+                    .into_iter()
+                    .map(|packet| packet.raw)
+                    .collect()
+            })
+            .unwrap_or_default();
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -1345,6 +1359,7 @@ impl GhosttyPaneTerminal {
                 clipboard_writes: Vec::new(),
                 reported_cwd: None,
                 terminal_responses: Vec::new(),
+                transfer_commands,
             };
         };
 
@@ -1479,6 +1494,7 @@ impl GhosttyPaneTerminal {
             clipboard_writes,
             reported_cwd,
             terminal_responses,
+            transfer_commands,
         }
     }
 
@@ -7210,5 +7226,80 @@ mod tests {
         let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
         trim_trailing_blank_rows(&mut rows);
         assert_eq!(rows, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn terminal_transfer_live_pty_processing_is_fragmented_and_never_replays_history() {
+        let (tx, _rx) = mpsc::channel(4);
+        let pane = GhosttyPaneTerminal::new(
+            crate::ghostty::Terminal::new(80, 24, 100).unwrap(),
+            tx.clone(),
+        )
+        .unwrap();
+        let command = b"\x1b]5113;ac=send;id=live\x07";
+        pane.seed_history_ansi(std::str::from_utf8(command).unwrap());
+        let pane_id = PaneId::from_raw(1);
+        assert!(pane
+            .process_pty_bytes(pane_id, 0, b"ordinary output", &tx)
+            .transfer_commands
+            .is_empty());
+        assert!(pane
+            .process_pty_bytes(pane_id, 0, &command[..9], &tx)
+            .transfer_commands
+            .is_empty());
+        assert_eq!(
+            pane.process_pty_bytes(pane_id, 0, &command[9..], &tx)
+                .transfer_commands,
+            vec![command.to_vec()]
+        );
+        assert!(pane
+            .process_pty_bytes(pane_id, 0, b"more output", &tx)
+            .transfer_commands
+            .is_empty());
+    }
+
+    #[test]
+    #[ignore = "supporting PTY scanner scaling profile; run with bench-render-scale"]
+    fn render_scale_profile_terminal_transfer_processing() {
+        let (tx, _rx) = mpsc::channel(4);
+        let payload = format!(
+            "\x1b[H{}",
+            "ordinary UTF-8 output αβγ 0123456789\r\n".repeat(48)
+        )
+        .into_bytes();
+        let mut per_pane = Vec::new();
+        for count in [1, 15] {
+            let panes: Vec<_> = (0..count)
+                .map(|_| {
+                    let pane = GhosttyPaneTerminal::new(
+                        crate::ghostty::Terminal::new(80, 24, 100).unwrap(),
+                        tx.clone(),
+                    )
+                    .unwrap();
+                    pane.process_pty_bytes(PaneId::from_raw(1), 0, &payload, &tx);
+                    pane
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            for _ in 0..128 {
+                for (index, pane) in panes.iter().enumerate() {
+                    let result = pane.process_pty_bytes(
+                        PaneId::from_raw(index as u32 + 1),
+                        0,
+                        &payload,
+                        &tx,
+                    );
+                    assert!(result.transfer_commands.is_empty());
+                    std::hint::black_box(result);
+                }
+            }
+            let elapsed = start.elapsed();
+            per_pane.push(elapsed.as_secs_f64() / count as f64);
+            eprintln!("terminal transfer PTY profile: {count} panes, 80x24, {} bytes/pane, {elapsed:?}, {:.3} ms/pane", payload.len() * 128, elapsed.as_secs_f64() * 1000.0 / count as f64);
+        }
+        eprintln!(
+            "terminal transfer PTY per-pane scaling ratio 15/1: {:.3}",
+            per_pane[1] / per_pane[0]
+        );
     }
 }

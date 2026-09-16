@@ -124,6 +124,8 @@ pub(crate) struct ClientWriter {
     pub(crate) control: ClientControlWriter,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: ClientRenderWriter,
+    /// Whether the endpoint hello advertised support for terminal.transfer.
+    pub(crate) terminal_transfer: bool,
 }
 
 impl ClientWriter {
@@ -155,11 +157,13 @@ impl ClientWriter {
         let writer = Self {
             control: control_writer,
             render: render_writer,
+            terminal_transfer: false,
         };
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
                 let sent = match item {
                     ClientWriteItem::Control(data) => control.send(data).is_ok(),
+                    ClientWriteItem::Transfer(data) => control.send(data).is_ok(),
                     ClientWriteItem::Render(data) => render.send(data).is_ok(),
                 };
                 if !sent {
@@ -221,6 +225,10 @@ impl ClientControlWriter {
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         self.queue.send_control(data)
     }
+
+    pub(crate) fn try_send_transfer(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        self.queue.try_send_transfer(data)
+    }
 }
 
 impl ClientRenderWriter {
@@ -255,6 +263,8 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    transfer: VecDeque<Vec<u8>>,
+    transfer_bytes: usize,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
@@ -264,8 +274,11 @@ struct ClientWriterQueueState {
 #[derive(Debug, PartialEq, Eq)]
 enum ClientWriteItem {
     Control(Vec<u8>),
+    Transfer(Vec<u8>),
     Render(Vec<u8>),
 }
+
+const MAX_TRANSFER_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 impl ClientWriterQueue {
     fn new() -> Arc<Self> {
@@ -312,6 +325,20 @@ impl ClientWriterQueue {
         Ok(())
     }
 
+    fn try_send_transfer(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive {
+            return Err(TrySendError::Disconnected(data));
+        }
+        if data.len() > MAX_TRANSFER_QUEUE_BYTES.saturating_sub(state.transfer_bytes) {
+            return Err(TrySendError::Full(data));
+        }
+        state.transfer_bytes = state.transfer_bytes.saturating_add(data.len());
+        state.transfer.push_back(data);
+        self.ready.notify_one();
+        Ok(())
+    }
+
     fn discard_pending_render(&self) {
         let mut state = self.lock_state();
         state.render = None;
@@ -341,6 +368,10 @@ impl ClientWriterQueue {
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
             }
+            if let Some(data) = state.transfer.pop_front() {
+                state.transfer_bytes = state.transfer_bytes.saturating_sub(data.len());
+                return Some(ClientWriteItem::Transfer(data));
+            }
             if let Some(data) = state.ordered.pop_front() {
                 self.ready.notify_one();
                 return Some(ClientWriteItem::Render(data));
@@ -361,6 +392,8 @@ impl ClientWriterQueue {
     fn close_writer(&self) {
         let mut state = self.lock_state();
         state.writer_alive = false;
+        state.transfer.clear();
+        state.transfer_bytes = 0;
         state.render = None;
         state.ordered.clear();
         self.ready.notify_all();
@@ -767,6 +800,7 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_active,
                     hello.surface_reuse,
                     hello.surface_delta,
+                    hello.terminal_transfer,
                 )),
             )
         }
@@ -839,6 +873,7 @@ pub(crate) fn handle_client_handshake(
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
+        terminal_transfer: shell_options.as_ref().is_some_and(|options| options.7),
     };
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
@@ -863,6 +898,7 @@ pub(crate) fn handle_client_handshake(
         surface_active,
         surface_reuse,
         surface_delta,
+        _terminal_transfer,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -935,6 +971,7 @@ fn client_writer_loop(
     while let Some(item) = writer_queue.recv() {
         let written = match item {
             ClientWriteItem::Control(data) => write_framed_bytes(&mut stream, &data),
+            ClientWriteItem::Transfer(data) => write_framed_bytes(&mut stream, &data),
             ClientWriteItem::Render(data) => {
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
@@ -1454,6 +1491,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            terminal_transfer: false,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1502,6 +1540,7 @@ mod tests {
             ClientWriter {
                 control: ClientControlWriter::queue(queue.clone()),
                 render: ClientRenderWriter::queue(queue.clone()),
+                terminal_transfer: false,
             },
             queue,
         )
@@ -2406,5 +2445,31 @@ mod tests {
              connection close within the 5-second deadline",
             HANDSHAKE_TIMEOUT
         );
+    }
+
+    #[test]
+    fn terminal_transfer_queue_is_bounded_and_cancellation_has_priority() {
+        let queue = ClientWriterQueue::new();
+        queue
+            .try_send_transfer(vec![0; MAX_TRANSFER_QUEUE_BYTES])
+            .unwrap();
+        assert!(matches!(
+            queue.try_send_transfer(vec![1]),
+            Err(TrySendError::Full(_))
+        ));
+        queue.send_control(b"cancel".to_vec()).unwrap();
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Control(b"cancel".to_vec()))
+        );
+        assert!(matches!(queue.recv(), Some(ClientWriteItem::Transfer(_))));
+        assert_eq!(queue.lock_state().transfer_bytes, 0);
+        queue.try_send_transfer(vec![1]).unwrap();
+        queue.close_writer();
+        assert!(matches!(
+            queue.try_send_transfer(vec![1]),
+            Err(TrySendError::Disconnected(_))
+        ));
+        assert_eq!(queue.lock_state().transfer_bytes, 0);
     }
 }

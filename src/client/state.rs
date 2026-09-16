@@ -24,6 +24,8 @@ pub(super) struct ClientState {
     #[cfg(unix)]
     pub(super) direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
     #[cfg(unix)]
+    pub(super) terminal_transfer: super::terminal_transfer::ClientTransferState,
+    #[cfg(unix)]
     pub(super) retired_direct_graphics: Option<(endpoint::ClientEndpointId, u64, u32)>,
     #[cfg(unix)]
     pub(super) pending_surface_graphics:

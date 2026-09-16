@@ -80,6 +80,7 @@ mod pane_graphics;
 mod render;
 mod retained_surface;
 mod surface_interest;
+mod terminal_transfer;
 
 pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
@@ -230,6 +231,8 @@ pub struct HeadlessServer {
     server_config_diagnostic_without_keybindings: Option<String>,
     /// Writable direct attach owner per terminal id string.
     terminal_attach_owners: HashMap<String, u64>,
+    /// Kitty transfer sessions pinned to their initiating client and terminal.
+    transfer_routes: HashMap<String, terminal_transfer::TransferRoute>,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -367,6 +370,7 @@ impl HeadlessServer {
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
+            transfer_routes: HashMap::new(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
@@ -402,6 +406,7 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        let mut next_transfer_maintenance = Instant::now();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -421,6 +426,14 @@ impl HeadlessServer {
                 );
                 self.initiate_shutdown();
                 continue;
+            }
+
+            // Expiry must also advance under continuous PTY events, which can
+            // otherwise postpone the idle accept-poll timer indefinitely.
+            let transfer_now = Instant::now();
+            if transfer_now >= next_transfer_maintenance {
+                self.maintain_terminal_transfers(transfer_now);
+                next_transfer_maintenance = transfer_now + Duration::from_secs(1);
             }
 
             // 1. Check the coalesced render signal from PTY readers and generic runtime work.
@@ -993,6 +1006,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.cancel_terminal_transfers_for_client(client_id);
         self.retire_direct_graphics_for_client(client_id);
         let disconnected_focus = self
             .clients
@@ -1777,6 +1791,7 @@ impl HeadlessServer {
     fn disconnect_all_clients_for_handoff(&mut self) {
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
         for client_id in client_ids {
+            self.cancel_terminal_transfers_for_client(client_id);
             self.send_to_client(
                 client_id,
                 ServerMessage::ServerShutdown {

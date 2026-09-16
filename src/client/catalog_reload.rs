@@ -131,6 +131,8 @@ mod tests {
             #[cfg(unix)]
             direct_graphics_response: Default::default(),
             #[cfg(unix)]
+            terminal_transfer: Default::default(),
+            #[cfg(unix)]
             retired_direct_graphics: None,
             #[cfg(unix)]
             pending_surface_graphics: HashMap::new(),

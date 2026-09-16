@@ -191,6 +191,8 @@ pub(crate) struct ClientConnection {
     pub(crate) shell_deferred_navigation_response: Option<Vec<u8>>,
     /// Whether this shell uses the endpoint-owned keymap rather than a client-owned keymap.
     pub(crate) shell_uses_endpoint_keybindings: bool,
+    /// Whether this client advertised the additive terminal.transfer method.
+    pub(crate) terminal_transfer: bool,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -253,6 +255,9 @@ impl ClientConnection {
             shell_deferred_navigation_request_id: None,
             shell_deferred_navigation_response: None,
             shell_uses_endpoint_keybindings: false,
+            terminal_transfer: writer
+                .as_ref()
+                .is_some_and(|writer| writer.terminal_transfer),
             writer,
         }
     }

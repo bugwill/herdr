@@ -143,6 +143,13 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A complete Kitty OSC 5113 command emitted by a pane. The server owns
+    /// routing it to the pinned outer client.
+    TerminalTransfer {
+        pane_id: PaneId,
+        source: crate::terminal_transfer::TransferSource,
+        command: Vec<u8>,
+    },
     /// A pane child reported its shell current directory through terminal
     /// metadata such as OSC 7.
     TerminalCwdReported {

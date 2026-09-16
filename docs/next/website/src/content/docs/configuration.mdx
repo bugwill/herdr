@@ -525,6 +525,12 @@ The legacy `experimental.kitty_graphics` setting remains accepted for existing c
 
 Changing this setting requires restarting the affected Herdr server or reattaching the client. In remote sessions, the server's setting controls pane graphics parsing and API availability, while the local client's setting controls output to the outer terminal.
 
+On Unix, Herdr supports `kitten transfer` uploads and downloads through a compatible outer terminal such as Kitty. Kitty still handles the permission prompt. Transfers stay attached to their original pane when focus changes, and require no Herdr setting. For example, download a file from a Herdr pane to the outer terminal's machine:
+
+```bash
+kitten transfer --direction=download ./file.txt '~/Downloads/'
+```
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:

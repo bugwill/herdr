@@ -96,6 +96,7 @@ fn unix_stdin_reader_loop(
     let mut pending_mode = None;
     let mut last_geometry = None;
     let mut direct_filter = super::direct_graphics::InputFilter::default();
+    let mut transfer_input = crate::terminal_transfer::TransferInputExtractor::default();
 
     while !should_quit.load(Ordering::Acquire) {
         if direct_filter.has_pending()
@@ -127,46 +128,115 @@ fn unix_stdin_reader_loop(
                         crate::input::mouse::HostGeometry::current(),
                     );
                 }
-                let filtered = filter_direct_input(
-                    &scratch[..n],
-                    &mut direct_filter,
-                    &direct_response,
-                    &direct_response_active,
-                );
-                let chunks = if let Some((raw_chunks, responses)) = filtered {
-                    for response in responses {
-                        if event_tx
-                            .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
-                            .is_err()
-                        {
-                            return;
+                for extracted in transfer_input.push(&scratch[..n]) {
+                    let input = match extracted {
+                        crate::terminal_transfer::ExtractedInput::Transfer(packet) => {
+                            if event_tx
+                                .blocking_send(ClientLoopEvent::TerminalTransferResponse(
+                                    packet.raw,
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
                         }
+                        crate::terminal_transfer::ExtractedInput::Input(input) => input,
+                    };
+                    let filtered = filter_direct_input(
+                        &input,
+                        &mut direct_filter,
+                        &direct_response,
+                        &direct_response_active,
+                    );
+                    let chunks = if let Some((raw_chunks, responses)) = filtered {
+                        for response in responses {
+                            if event_tx
+                                .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        raw_chunks
+                            .into_iter()
+                            .flat_map(|chunk| framer.push(&chunk))
+                            .collect()
+                    } else {
+                        framer.push(&input)
+                    };
+                    if !framer.has_pending_input() {
+                        pending_mode = None;
                     }
-                    raw_chunks
-                        .into_iter()
-                        .flat_map(|chunk| framer.push(&chunk))
-                        .collect()
-                } else {
-                    framer.push(&scratch[..n])
-                };
+                    if !send_unix_input_chunks(
+                        chunks,
+                        &event_tx,
+                        &mut pending_palette,
+                        sgr_pixels,
+                        last_geometry,
+                    ) {
+                        return;
+                    }
+                }
                 if !framer.has_pending_input() {
                     pending_mode = None;
                 }
-                if !send_unix_input_chunks(
-                    chunks,
-                    &event_tx,
-                    &mut pending_palette,
-                    sgr_pixels,
-                    last_geometry,
-                ) {
-                    return;
-                }
 
-                let timeout_ms = idle_flush_timeout_ms(
-                    &framer,
-                    host_mouse_capture_active.load(Ordering::Acquire),
-                );
+                let mouse_capture = host_mouse_capture_active.load(Ordering::Acquire);
+                let timeout_ms = if mouse_capture && transfer_input.pending_mouse_escape() {
+                    crate::raw_input::MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS
+                } else {
+                    idle_flush_timeout_ms(&framer, mouse_capture)
+                };
                 if stdin_read_ready(&reader, timeout_ms) == Some(false) {
+                    for extracted in transfer_input.flush_timeout() {
+                        let input = match extracted {
+                            crate::terminal_transfer::ExtractedInput::Transfer(packet) => {
+                                if event_tx
+                                    .blocking_send(ClientLoopEvent::TerminalTransferResponse(
+                                        packet.raw,
+                                    ))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            crate::terminal_transfer::ExtractedInput::Input(input) => input,
+                        };
+                        let chunks = if let Some((raw_chunks, responses)) = filter_direct_input(
+                            &input,
+                            &mut direct_filter,
+                            &direct_response,
+                            &direct_response_active,
+                        ) {
+                            for response in responses {
+                                if event_tx
+                                    .blocking_send(ClientLoopEvent::DirectGraphicsResponse(
+                                        response,
+                                    ))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            raw_chunks
+                                .into_iter()
+                                .flat_map(|chunk| framer.push(&chunk))
+                                .collect()
+                        } else {
+                            framer.push(&input)
+                        };
+                        if !send_unix_input_chunks(
+                            chunks,
+                            &event_tx,
+                            &mut pending_palette,
+                            sgr_pixels,
+                            last_geometry,
+                        ) {
+                            return;
+                        }
+                    }
                     let had_pending = framer.has_pending_input();
                     let chunks = framer.flush_timeout();
                     let held_escape = had_pending && chunks.is_empty();

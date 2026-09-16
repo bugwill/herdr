@@ -42,6 +42,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "tab.focus",
     "tab.move",
     "tab.rename",
+    "terminal.transfer",
     "workspace.close",
     "workspace.create",
     "workspace.focus",
@@ -291,6 +292,10 @@ mod tests {
         assert_eq!(
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+        );
+        assert_eq!(
+            actual.remove("terminal.transfer").as_deref(),
+            Some("91a0467940888d7b13eb464d2704e7f198d181cca91df354774ff4d7c99eabd5")
         );
 
         assert_eq!(

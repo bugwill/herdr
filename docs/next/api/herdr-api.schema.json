@@ -4423,6 +4423,60 @@
           ],
           "type": "object"
         },
+        "TerminalTransferParams": {
+          "description": "A client-owned terminal transfer response or cancellation. This method is\nintentionally separate from the generation-one request shapes so the\nexisting endpoint digests remain frozen.",
+          "oneOf": [
+            {
+              "properties": {
+                "data": {
+                  "type": "string"
+                },
+                "operation": {
+                  "const": "reply",
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation",
+                "terminal_id",
+                "session_id",
+                "data"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "operation": {
+                  "const": "cancel",
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "terminal_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "operation",
+                "terminal_id",
+                "session_id",
+                "message"
+              ],
+              "type": "object"
+            }
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -4947,6 +5001,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ClientShellSurfaceSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.transfer",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalTransferParams"
             }
           },
           "required": [

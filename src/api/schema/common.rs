@@ -67,6 +67,15 @@ pub struct ClientShellSurfaceSetParams {
     pub active: bool,
 }
 
+/// A client-owned terminal transfer response or cancellation. This method is
+/// intentionally separate from the generation-one request shapes so the
+/// existing endpoint digests remain frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalTransferParams {
+    #[serde(flatten)]
+    pub operation: crate::terminal_transfer::TransferOperation,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {

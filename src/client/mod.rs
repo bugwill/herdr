@@ -35,6 +35,8 @@ mod state;
 mod terminal_geometry;
 mod terminal_sessions;
 mod terminal_setup;
+#[cfg(unix)]
+mod terminal_transfer;
 mod timer;
 mod transport;
 
@@ -404,6 +406,8 @@ async fn run_client_loop(
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
         #[cfg(unix)]
+        terminal_transfer: terminal_transfer::ClientTransferState::new(),
+        #[cfg(unix)]
         retired_direct_graphics: None,
         #[cfg(unix)]
         pending_surface_graphics: HashMap::new(),
@@ -745,6 +749,13 @@ async fn run_client_loop(
 
         match event {
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
+            #[cfg(unix)]
+            ClientLoopEvent::TerminalTransferResponse(command) => {
+                state
+                    .terminal_transfer
+                    .handle_input(&command, &mut write_stream, &mut io::stdout())
+                    .map_err(ClientError::ConnectionFailed)?;
+            }
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
                 let image_bridge_active = endpoint_accepts_local_images(
@@ -1287,12 +1298,22 @@ async fn run_client_loop(
                         boot_id,
                         request_id,
                         ..
-                    } => endpoint_commands.accepts_response(
-                        &endpoint_id,
-                        generation,
-                        boot_id,
-                        request_id,
-                    ),
+                    } => {
+                        let endpoint_response = endpoint_commands.accepts_response(
+                            &endpoint_id,
+                            generation,
+                            boot_id,
+                            request_id,
+                        );
+                        #[cfg(unix)]
+                        {
+                            endpoint_response || state.terminal_transfer.has_response(request_id)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            endpoint_response
+                        }
+                    }
                     _ => false,
                 };
                 if !endpoint::accepts_endpoint_message(
@@ -1641,6 +1662,21 @@ async fn run_client_loop(
                         final_chunk,
                         data,
                     } => {
+                        #[cfg(unix)]
+                        if state.terminal_transfer.has_response(&request_id) {
+                            state
+                                .terminal_transfer
+                                .handle_response(
+                                    (&endpoint_id, generation, &boot_id),
+                                    &request_id,
+                                    final_chunk,
+                                    &data,
+                                    &mut write_stream,
+                                    &mut io::stdout(),
+                                )
+                                .map_err(ClientError::ConnectionFailed)?;
+                            continue;
+                        }
                         if pending_activation.as_ref().is_some_and(|pending| {
                             pending.accepts_response(
                                 &endpoint_id,
@@ -1863,6 +1899,47 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        #[cfg(unix)]
+                        if kind == crate::terminal_transfer::OSC_TRANSFER_CONTROL_KIND {
+                            if !write_stream
+                                .connection(&endpoint_id)
+                                .is_some_and(|connection| {
+                                    connection.negotiation.supports_method("terminal.transfer")
+                                })
+                            {
+                                warn!(
+                                    ?endpoint_id,
+                                    "ignoring terminal transfer control from an endpoint without the advertised method"
+                                );
+                                continue;
+                            }
+                            let Ok(control) = serde_json::from_str::<
+                                crate::terminal_transfer::TransferControl,
+                            >(&data) else {
+                                warn!(?endpoint_id, "invalid terminal transfer control");
+                                continue;
+                            };
+                            if state
+                                .shell
+                                .as_ref()
+                                .and_then(|shell| shell.endpoint_boot_id(&endpoint_id))
+                                != Some(control.boot_id.as_str())
+                            {
+                                continue;
+                            }
+                            state
+                                .terminal_transfer
+                                .handle_control(
+                                    control,
+                                    endpoint_id.clone(),
+                                    generation,
+                                    endpoint_active && pending_activation.is_none(),
+                                    &mut write_stream,
+                                    &mut io::stdout(),
+                                )
+                                .map_err(ClientError::ConnectionFailed)?;
+                            continue;
+                        }
                         if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
                             let progress = pending_activation.as_mut().map(|activation| {
                                 activation.receive_presentation_effects_ready(
@@ -2005,6 +2082,11 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Timer => {
                 client_timer.fired();
+                #[cfg(unix)]
+                state
+                    .terminal_transfer
+                    .maintain(now, &mut write_stream, &mut io::stdout())
+                    .map_err(ClientError::ConnectionFailed)?;
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();

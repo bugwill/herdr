@@ -90,6 +90,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_config_diagnostic: None,
         server_config_diagnostic_without_keybindings: None,
         terminal_attach_owners: HashMap::new(),
+        transfer_routes: HashMap::new(),
         pending_alt_screen_reads: Vec::new(),
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,
@@ -6909,5 +6910,251 @@ fn no_handle_internal_event_bypass_in_module() {
         "Found direct calls to self.app.handle_internal_event outside \
              handle_internal_event_with_forwarding (bypass risk):\n  {}",
         bypass_lines.join("\n  ")
+    );
+}
+
+struct TransferTest {
+    server: HeadlessServer,
+    pane: crate::layout::PaneId,
+    terminal: crate::terminal::TerminalId,
+    input: tokio::sync::mpsc::Receiver<Bytes>,
+    control: std::sync::mpsc::Receiver<Vec<u8>>,
+    _render: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl TransferTest {
+    fn new(capacity: usize) -> Self {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("transfer");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal = workspace.terminal_id(pane).unwrap().clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let (runtime, input) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal.clone(), runtime);
+        let (mut writer, control, render) = test_client_writer();
+        writer.terminal_transfer = true;
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        Self {
+            server,
+            pane,
+            terminal,
+            input,
+            control,
+            _render: render,
+        }
+    }
+
+    fn source(&self) -> crate::terminal_transfer::TransferSource {
+        self.server
+            .app
+            .terminal_runtimes
+            .get(&self.terminal)
+            .unwrap()
+            .transfer_source()
+    }
+
+    fn reply(&self, command: &[u8]) -> crate::terminal_transfer::TransferOperation {
+        crate::terminal_transfer::TransferOperation::Reply {
+            terminal_id: self.terminal.to_string(),
+            session_id: "s".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(command),
+        }
+    }
+
+    fn control(&self) -> crate::terminal_transfer::TransferControl {
+        let ServerMessage::EndpointControl { kind, data } =
+            read_server_message(self.control.recv_timeout(Duration::from_secs(1)).unwrap())
+        else {
+            panic!("expected transfer control")
+        };
+        assert_eq!(kind, crate::terminal_transfer::OSC_TRANSFER_CONTROL_KIND);
+        serde_json::from_str(&data).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn terminal_transfer_server_validates_owner_and_routes_inactive_busy_replies() {
+    let mut test = TransferTest::new(8);
+    let start = b"\x1b]5113;ac=send;id=s;pw=sha256:unchanged\x07";
+    test.server
+        .forward_terminal_transfer(test.pane, test.source(), start);
+    assert_eq!(test.control().decode_command().unwrap(), start);
+    let response = b"\x1b]5113;ac=status;id=s;st=T0s=\x07";
+    let reply = test.reply(response);
+    assert_eq!(
+        test.server
+            .handle_terminal_transfer_request(2, reply.clone())
+            .unwrap_err()
+            .0,
+        "stale_transfer"
+    );
+    for bad in [
+        b"echo injected\n".as_slice(),
+        b"\x1b]5113;ac=status;id=wrong;st=T0s=\x07",
+        b"\x1b]5113;ac=send;id=s\x07",
+    ] {
+        assert_eq!(
+            test.server
+                .handle_terminal_transfer_request(1, test.reply(bad))
+                .unwrap_err()
+                .0,
+            "invalid_transfer"
+        );
+    }
+    assert!(test.input.try_recv().is_err());
+    test.server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .shell_surface_active = false;
+    test.server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .shell_endpoint_command_in_flight = true;
+    let request = serde_json::from_value(
+        serde_json::json!({"id":"bound-reply","method":"terminal.transfer","params":reply}),
+    )
+    .unwrap();
+    test.server
+        .handle_client_shell_endpoint_request(1, "test-boot".into(), Box::new(request));
+    assert_eq!(test.input.try_recv().unwrap().as_ref(), response);
+    let ServerMessage::ClientShellEndpointResponseChunk { data, .. } =
+        read_server_message(test.control.recv_timeout(Duration::from_secs(1)).unwrap())
+    else {
+        panic!("expected API acknowledgement")
+    };
+    let ack: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    assert!(ack.get("result").is_some(), "{ack}");
+    test.server.cancel_terminal_transfers_for_client(1);
+    assert!(test.control().retire);
+    assert!(crate::terminal_transfer::session_error(
+        &test.input.try_recv().unwrap()
+    ));
+    test.server
+        .handle_terminal_transfer_request(1, test.reply(response))
+        .unwrap();
+    assert!(
+        test.input.try_recv().is_err(),
+        "late reply must never reach PTY"
+    );
+}
+
+#[tokio::test]
+async fn terminal_transfer_server_reports_unavailable_collision_and_backpressure() {
+    let mut test = TransferTest::new(1);
+    let start = b"\x1b]5113;ac=send;id=s\x07";
+    test.server.clients.get_mut(&1).unwrap().terminal_transfer = false;
+    test.server
+        .forward_terminal_transfer(test.pane, test.source(), start);
+    assert!(crate::terminal_transfer::session_error(
+        &test.input.try_recv().unwrap()
+    ));
+    assert!(test.server.transfer_routes.is_empty());
+    test.server.clients.get_mut(&1).unwrap().terminal_transfer = true;
+    test.server
+        .forward_terminal_transfer(test.pane, test.source(), start);
+    assert!(!test.control().retire);
+    test.server
+        .forward_terminal_transfer(test.pane, test.source(), start);
+    assert!(crate::terminal_transfer::session_error(
+        &test.input.try_recv().unwrap()
+    ));
+    let response = b"\x1b]5113;ac=status;id=s;st=T0s=\x07";
+    test.server
+        .handle_terminal_transfer_request(1, test.reply(response))
+        .unwrap();
+    assert_eq!(
+        test.server
+            .handle_terminal_transfer_request(1, test.reply(response))
+            .unwrap_err()
+            .0,
+        "transfer_backpressure"
+    );
+    assert!(test.control().retire);
+    assert_eq!(test.input.try_recv().unwrap().as_ref(), response);
+    test.server
+        .handle_terminal_transfer_request(1, test.reply(response))
+        .unwrap();
+    assert!(test.input.try_recv().is_err());
+    test.server.maintain_terminal_transfers(
+        Instant::now() + crate::terminal_transfer::TRANSFER_DRAIN_TIMEOUT + Duration::from_secs(1),
+    );
+    assert!(test.server.transfer_routes.is_empty());
+}
+
+#[tokio::test]
+async fn terminal_transfer_server_terminal_removal_cancels_outer_session() {
+    let mut test = TransferTest::new(8);
+    test.server.forward_terminal_transfer(
+        test.pane,
+        test.source(),
+        b"\x1b]5113;ac=receive;id=s\x07",
+    );
+    assert!(!test.control().retire);
+    test.server.app.terminal_runtimes.remove(&test.terminal);
+    test.server.maintain_terminal_transfers(Instant::now());
+    assert!(test.control().retire);
+}
+
+#[tokio::test]
+async fn terminal_transfer_handoff_aborts_before_disconnecting_client() {
+    let mut test = TransferTest::new(8);
+    test.server
+        .forward_terminal_transfer(test.pane, test.source(), b"\x1b]5113;ac=send;id=s\x07");
+    assert!(!test.control().retire);
+    test.server.disconnect_all_clients_for_handoff();
+    assert!(test.control().retire);
+    assert!(crate::terminal_transfer::session_error(
+        &test.input.try_recv().unwrap()
+    ));
+    assert!(test.server.clients.is_empty());
+}
+
+#[tokio::test]
+async fn terminal_transfer_replaced_runtime_rejects_old_output_and_host_replies() {
+    let mut test = TransferTest::new(8);
+    let source = test.source();
+    test.server
+        .forward_terminal_transfer(test.pane, source.clone(), b"\x1b]5113;ac=send;id=s\x07");
+    assert!(!test.control().retire);
+    let (runtime, mut replacement_input) =
+        crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    test.server
+        .app
+        .terminal_runtimes
+        .insert(test.terminal.clone(), runtime);
+    assert_eq!(
+        test.server
+            .handle_terminal_transfer_request(
+                1,
+                test.reply(b"\x1b]5113;ac=status;id=s;st=T0s=\x07")
+            )
+            .unwrap_err()
+            .0,
+        "stale_transfer"
+    );
+    assert!(test.control().retire);
+    test.server
+        .forward_terminal_transfer(test.pane, source, b"\x1b]5113;ac=send;id=old\x07");
+    assert!(!test.server.transfer_routes.contains_key("old"));
+    assert!(
+        replacement_input.try_recv().is_err(),
+        "no old response or failure may reach replacement process"
     );
 }
