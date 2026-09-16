@@ -23,10 +23,21 @@ impl HeadlessServer {
         source: crate::terminal_transfer::TransferSource,
         command: &[u8],
     ) {
-        let Some((_, pane)) = self.app.find_pane(pane_id) else {
+        let terminal_id = self
+            .app
+            .find_pane(pane_id)
+            .map(|(_, pane)| pane.attached_terminal_id.clone())
+            .or_else(|| {
+                self.app
+                    .state
+                    .popup_pane
+                    .as_ref()
+                    .filter(|popup| popup.pane_id == pane_id)
+                    .map(|popup| popup.terminal_id.clone())
+            });
+        let Some(terminal_id) = terminal_id else {
             return;
         };
-        let terminal_id = pane.attached_terminal_id.clone();
         if !self
             .app
             .terminal_runtimes

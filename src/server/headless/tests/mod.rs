@@ -6988,6 +6988,46 @@ impl TransferTest {
 }
 
 #[tokio::test]
+async fn terminal_transfer_server_routes_popup_runtime() {
+    let mut server = test_headless_server();
+    let (popup_runtime, _input) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+    let (popup_pane, popup_terminal) = server.app.install_test_popup_runtime(popup_runtime);
+    let (mut writer, control, _render) = test_client_writer();
+    writer.terminal_transfer = true;
+    server.clients.insert(
+        1,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        ),
+    );
+    server.foreground_client_id = Some(1);
+    let source = server
+        .app
+        .terminal_runtimes
+        .get(&popup_terminal)
+        .expect("popup runtime")
+        .transfer_source();
+    let start = b"\x1b]5113;ac=send;id=popup\x07";
+
+    server.forward_terminal_transfer(popup_pane, source, start);
+
+    let ServerMessage::EndpointControl { kind, data } =
+        read_server_message(control.recv_timeout(Duration::from_secs(1)).unwrap())
+    else {
+        panic!("expected transfer control for popup runtime");
+    };
+    assert_eq!(kind, crate::terminal_transfer::OSC_TRANSFER_CONTROL_KIND);
+    let control: crate::terminal_transfer::TransferControl = serde_json::from_str(&data).unwrap();
+    assert_eq!(control.decode_command().unwrap(), start);
+    assert_eq!(control.terminal_id, popup_terminal.to_string());
+}
+
+#[tokio::test]
 async fn terminal_transfer_server_validates_owner_and_routes_inactive_busy_replies() {
     let mut test = TransferTest::new(8);
     let start = b"\x1b]5113;ac=send;id=s;pw=sha256:unchanged\x07";
