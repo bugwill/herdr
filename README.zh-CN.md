@@ -53,13 +53,38 @@ herdr
 
 运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
 
-### 通过 `--remote` 使用 Kitty 文件传输
+### 本分叉的修改：Kitty 终端文件传输
 
-使用 `herdr --remote` 时，Kitty 的 `kitten transfer` 会经过两端 Herdr：
-远程 server 转发 Kitty 的 OSC 5113 命令，本地 client 负责与 Kitty 终端交互。
-两端都必须使用支持终端传输的构建版本。只更新远程 server、保留旧的本地
-client 仍然无法完成传输。不支持传输时，server 使用 Kitty 要求的无 padding
-Base64 状态格式，以便 Kitty 显示真正的失败原因。
+本分叉在 Unix 上增加了 Kitty `kitten transfer` 协议（OSC 5113）支持，
+因此可以在 Herdr 窗格中上传和下载文件，而不由 Herdr 自己读取或写入被传输的
+文件。权限提示和实际文件 I/O 仍由 Kitty 负责。
+
+实现分布在 PTY、server 和外层 client 三部分：
+
+- PTY scanner 即使在一次读取中被拆开，也能识别完整的 OSC 5113 帧；支持 BEL、
+  ST 和 C1 终止符，保留普通终端输入，拒绝畸形或注入帧，并将命令限制为 64 KiB。
+- server 将每个传输会话固定到发起它的 pane/runtime 和外层 client，通过声明的
+  `terminal.transfer.v1` endpoint control 通道转发；同时校验会话所有权和过期
+  runtime，最多允许 64 个活动会话，并在空闲、取消、断开或背压时回收会话，
+  不阻塞 PTY actor。
+- client 将传输响应与普通键盘、鼠标、bracketed paste 及其他终端控制输入分离。
+  即使焦点切换，传输仍绑定原来的 pane；Kitty 权限拒绝以及焦点恢复序列也会
+  按正确顺序处理。
+- JSON API 增加独立的 `terminal.transfer` 回复/取消方法；endpoint handshake
+  会声明能力，使旧 client 明确返回失败，而不会把传输字节注入 pane。失败状态
+  使用 Kitty 要求的无 padding Base64 格式。
+
+远程会话必须同时使用包含本分叉传输支持的远程 server 和本地 client。远程 server
+  转发 pane 发出的 OSC 5113 流量，本地 client 则负责与外层终端完成交换：
+
+```bash
+kitten transfer --direction=download ./file.txt '~/Downloads/'
+```
+
+不需要额外的 Herdr 配置。本功能目前仅在 Unix 上启用；Windows 构建保留上游的
+Windows 输入和终端修复，但不启用本分叉的传输路径。本分叉包含针对字节分片、
+C1/BEL/ST 帧、畸形和超大输入、paste 与鼠标保留、焦点顺序、过期会话拒绝、取消、
+背压以及 server 实时路由的测试。
 
 ## 文档
 

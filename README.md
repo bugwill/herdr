@@ -55,14 +55,47 @@ herdr
 
 run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
 
-### Kitty file transfers over `--remote`
+### fork-specific changes: Kitty terminal transfers
 
-Kitty's `kitten transfer` path crosses both Herdr processes when you run
-`herdr --remote`: the remote server forwards Kitty's OSC 5113 commands, and
-the local client talks to the Kitty terminal. Run a build with terminal
-transfer support on both sides. An older local client cannot complete the
-transfer even when the remote server is updated. Unsupported-client failures
-use Kitty's unpadded Base64 status format so Kitty reports the actual reason.
+This fork adds Unix support for Kitty's `kitten transfer` protocol (OSC 5113),
+so uploads and downloads can cross Herdr panes without Herdr reading or writing
+the transferred files itself. Kitty remains responsible for the permission
+prompt and the actual file I/O.
+
+The implementation is split across the PTY, server, and outer client:
+
+- The PTY scanner recognizes complete OSC 5113 frames even when a frame is
+  split across reads. It accepts BEL, ST, and C1 terminators, preserves normal
+  terminal input, rejects malformed or injected frames, and bounds commands to
+  64 KiB.
+- The server pins each transfer to its originating pane/runtime and outer
+  client, then forwards it through the advertised `terminal.transfer.v1`
+  endpoint control channel. It validates session ownership and stale runtimes,
+  limits live sessions to 64, and retires idle, cancelled, disconnected, or
+  backpressured transfers without blocking the PTY actor.
+- The client separates transfer responses from ordinary keyboard, mouse,
+  bracketed-paste, and terminal-control input. A transfer remains attached to
+  its original pane when focus changes, including Kitty permission-denial and
+  focus-return sequences.
+- The JSON API exposes a separate `terminal.transfer` reply/cancel method, and
+  endpoint handshakes advertise support so older clients fail explicitly
+  instead of injecting transfer bytes into a pane. Failure status messages use
+  Kitty's unpadded Base64 format.
+
+For a remote session, both the remote server and the local client must contain
+this fork's transfer support. The remote server forwards the pane's OSC 5113
+traffic, while the local client writes the outer-terminal side of the exchange:
+
+```bash
+kitten transfer --direction=download ./file.txt '~/Downloads/'
+```
+
+No Herdr setting is required. The feature is currently Unix-only; Windows
+builds retain the upstream Windows input and terminal fixes but do not enable
+this fork-specific transfer path. The fork includes focused tests for byte
+fragmentation, C1/BEL/ST framing, malformed and oversized input, paste and
+mouse preservation, focus ordering, stale-session rejection, cancellation,
+backpressure, and live server routing.
 
 ## docs
 

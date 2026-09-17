@@ -73,7 +73,7 @@ use terminal_geometry::{
 use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
 use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
-    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
+    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
 };
 
 fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
@@ -82,9 +82,7 @@ fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
     }
 }
 #[cfg(windows)]
-use terminal_setup::{
-    enable_windows_virtual_terminal_input, is_ssh_session, windows_vti_input_backend_enabled,
-};
+use terminal_setup::{is_ssh_session, windows_vti_input_backend_enabled};
 #[cfg(test)]
 use terminal_setup::{
     should_enable_host_color_scheme_reports, windows_virtual_terminal_input_mode,
@@ -329,6 +327,7 @@ fn run_client_with_mode(
             should_quit,
             loop_config,
             attach_escape,
+            &terminal_guard,
         )
         .await
     });
@@ -379,6 +378,7 @@ async fn run_client_loop(
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
+    _terminal_guard: &TerminalGuard,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
@@ -418,6 +418,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         presentation_frozen: false,
+        deferred_local_activation: None,
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
@@ -830,7 +831,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -994,7 +995,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -1098,7 +1099,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
@@ -1274,7 +1275,7 @@ async fn run_client_loop(
                     target,
                     force,
                     now,
-                    &event_tx,
+                    &mut scheduled_activation,
                 )?;
             }
             ClientLoopEvent::ServerMessage {
@@ -1780,7 +1781,7 @@ async fn run_client_loop(
                             &mut write_stream,
                             state.shell.as_mut(),
                             &mut state.detached_process_children,
-                            &event_tx,
+                            &mut scheduled_activation,
                         )?;
                         let repaint = repaint || dispatch_repaint;
                         if replay_mouse.is_empty() {
@@ -1812,7 +1813,7 @@ async fn run_client_loop(
                                 &mut pending_activation,
                                 &mut endpoint_commands,
                                 &mut prefix_input_source,
-                                &event_tx,
+                                &mut scheduled_activation,
                             )? {
                                 return Ok(());
                             }
@@ -1862,17 +1863,21 @@ async fn run_client_loop(
                         );
                         let mouse_mode_changed = enabled != state.mouse_capture_active
                             || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
+                        }
                         if mouse_mode_changed {
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
                             set_mouse_capture(enabled, next_sgr_pixels)
                                 .map_err(ClientError::ConnectionFailed)?;
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
+                        }
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
                         }
                         state.mouse_capture_active = enabled;
                         host_mouse_capture_active.store(enabled, Ordering::Release);
@@ -2039,6 +2044,14 @@ async fn run_client_loop(
                             }
                         }
                         write_stream.mark_ready(&endpoint_id, generation);
+                        if endpoint_id.is_local() {
+                            if let Some(event) =
+                                take_ready_local_activation(&mut state, &write_stream)
+                            {
+                                scheduled_activation = Some(event);
+                                continue;
+                            }
+                        }
                         let selected_endpoint = endpoint_catalog
                             .selected_profile
                             .as_ref()
@@ -2055,7 +2068,11 @@ async fn run_client_loop(
                         let needs_surface = write_stream
                             .connection(&selected_endpoint)
                             .is_some_and(|connection| !connection.surface_active);
-                        if activation_ready && needs_surface && pending_activation.is_none() {
+                        if activation_ready
+                            && needs_surface
+                            && pending_activation.is_none()
+                            && state.deferred_local_activation.is_none()
+                        {
                             scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
                                 endpoint_id: selected_endpoint,
                                 target: None,
@@ -2195,7 +2212,7 @@ async fn run_client_loop(
                         &mut pending_activation,
                         &mut endpoint_commands,
                         &mut prefix_input_source,
-                        &event_tx,
+                        &mut scheduled_activation,
                     )? {
                         return Ok(());
                     }
