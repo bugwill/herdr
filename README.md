@@ -55,6 +55,15 @@ herdr
 
 run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
 
+### Kitty file transfers over `--remote`
+
+Kitty's `kitten transfer` path crosses both Herdr processes when you run
+`herdr --remote`: the remote server forwards Kitty's OSC 5113 commands, and
+the local client talks to the Kitty terminal. Run a build with terminal
+transfer support on both sides. An older local client cannot complete the
+transfer even when the remote server is updated. Unsupported-client failures
+use Kitty's unpadded Base64 status format so Kitty reports the actual reason.
+
 ## docs
 
 everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)

@@ -53,6 +53,14 @@ herdr
 
 运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
 
+### 通过 `--remote` 使用 Kitty 文件传输
+
+使用 `herdr --remote` 时，Kitty 的 `kitten transfer` 会经过两端 Herdr：
+远程 server 转发 Kitty 的 OSC 5113 命令，本地 client 负责与 Kitty 终端交互。
+两端都必须使用支持终端传输的构建版本。只更新远程 server、保留旧的本地
+client 仍然无法完成传输。不支持传输时，server 使用 Kitty 要求的无 padding
+Base64 状态格式，以便 Kitty 显示真正的失败原因。
+
 ## 文档
 
 所有文档都在 [herdr.dev/docs](https://herdr.dev/zh-cn/docs/)：[快速开始](https://herdr.dev/zh-cn/docs/quick-start/) · [核心概念](https://herdr.dev/zh-cn/docs/concepts/) · [受支持的智能体](https://herdr.dev/zh-cn/docs/agents/) · [键盘](https://herdr.dev/zh-cn/docs/keyboard/) · [配置](https://herdr.dev/zh-cn/docs/configuration/) · [会话状态](https://herdr.dev/zh-cn/docs/session-state/) · [连接机器](https://herdr.dev/zh-cn/docs/connecting-machines/) · [远程访问](https://herdr.dev/zh-cn/docs/persistence-remote/) · [集成](https://herdr.dev/zh-cn/docs/integrations/) · [插件](https://herdr.dev/zh-cn/docs/plugins/) · [socket api](https://herdr.dev/zh-cn/docs/socket-api/)

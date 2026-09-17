@@ -318,7 +318,10 @@ fn permission_denied(raw: &[u8]) -> bool {
 }
 
 pub fn encode_failure(id: &str, message: &str) -> Vec<u8> {
-    let status = base64::engine::general_purpose::STANDARD.encode(message);
+    // Kitty's OSC 5113 status field uses unpadded Base64. Padding is accepted
+    // when decoding terminal responses for compatibility, but must not be
+    // emitted here because Kitty rejects a trailing `=` in `st`.
+    let status = base64::engine::general_purpose::STANDARD_NO_PAD.encode(message);
     format!("\x1b]5113;ac=status;id={id};st={status}\x1b\\").into_bytes()
 }
 
@@ -859,6 +862,15 @@ mod regression_tests {
         assert!(!session_error(
             b"\x1b]5113;ac=status;id=s;fid=one;st=RVBFUk0=\x07"
         ));
+    }
+
+    #[test]
+    fn terminal_transfer_failure_status_is_unpadded() {
+        assert_eq!(
+            encode_failure("s", "ENOTSUP:outer client does not support transfers"),
+            b"\x1b]5113;ac=status;id=s;st=RU5PVFNVUDpvdXRlciBjbGllbnQgZG9lcyBub3Qgc3VwcG9ydCB0cmFuc2ZlcnM\x1b\\"
+                .to_vec()
+        );
     }
 
     #[test]
