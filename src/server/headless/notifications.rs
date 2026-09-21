@@ -137,7 +137,7 @@ impl HeadlessServer {
         let is_active_tab = self
             .app
             .state
-            .pane_is_in_active_tab(update.ws_idx, update.pane_id);
+            .pane_is_focused(update.ws_idx, update.pane_id);
         let suppress_active_tab_notifications =
             self.active_tab_suppresses_notifications(is_active_tab);
 
@@ -391,11 +391,7 @@ impl HeadlessServer {
                     .app
                     .state
                     .active
-                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
-                    .is_some_and(|ws| {
-                        ws.find_tab_index_for_pane(pane_id_val)
-                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
-                    });
+                    .is_some_and(|ws_idx| self.app.state.pane_is_focused(ws_idx, pane_id_val));
 
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);
@@ -494,11 +490,7 @@ impl HeadlessServer {
                     .app
                     .state
                     .active
-                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
-                    .is_some_and(|ws| {
-                        ws.find_tab_index_for_pane(pane_id_val)
-                            .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
-                    });
+                    .is_some_and(|ws_idx| self.app.state.pane_is_focused(ws_idx, pane_id_val));
 
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);

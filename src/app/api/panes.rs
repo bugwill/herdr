@@ -474,7 +474,7 @@ impl App {
         };
 
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
-        self.state.mark_active_tab_seen();
+        self.state.mark_focused_pane_seen();
         self.state.mode = crate::app::Mode::Terminal;
 
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {

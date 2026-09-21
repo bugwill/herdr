@@ -870,7 +870,7 @@ impl HeadlessServer {
         apply_keybindings(&mut self.app, &server_keybindings);
         self.sync_visible_server_config_diagnostic(false);
         if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+            self.app.state.mark_focused_pane_seen();
         }
         self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,
@@ -3242,7 +3242,7 @@ impl HeadlessServer {
                 continue;
             }
 
-            let is_active_tab = self.app.state.pane_is_in_active_tab(*ws_idx, *pane_id);
+            let is_active_tab = self.app.state.pane_is_focused(*ws_idx, *pane_id);
             let suppress_active_tab_notifications =
                 self.active_tab_suppresses_notifications(is_active_tab);
 

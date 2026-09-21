@@ -308,18 +308,41 @@ impl AppState {
             return false;
         }
 
-        self.switch_workspace_tab(ws_idx, tab_idx);
+        let same_active_tab = self.active == Some(ws_idx)
+            && self
+                .workspaces
+                .get(ws_idx)
+                .is_some_and(|ws| ws.active_tab_index() == tab_idx);
+        if same_active_tab {
+            if let Some(tab) = self
+                .workspaces
+                .get_mut(ws_idx)
+                .and_then(|ws| ws.tabs.get_mut(tab_idx))
+            {
+                tab.layout.focus_pane(pane_id);
+                self.previous_pane_focus = previous;
+                self.mark_pane_seen(ws_idx, pane_id);
+                self.mark_session_dirty();
+                return true;
+            }
+            return false;
+        }
+
+        // Select the target before switching tabs so tab activation marks only
+        // the pane that will actually become visible, not the tab's old focus.
         if let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
             .and_then(|ws| ws.tabs.get_mut(tab_idx))
         {
             tab.layout.focus_pane(pane_id);
-            self.previous_pane_focus = previous;
-            self.mark_session_dirty();
-            return true;
+        } else {
+            return false;
         }
-        false
+        self.switch_workspace_tab(ws_idx, tab_idx);
+        self.mark_pane_seen(ws_idx, pane_id);
+        self.mark_session_dirty();
+        true
     }
 }
 
@@ -441,16 +464,13 @@ impl AppState {
         (changed_panes, changed_workspaces)
     }
 
-    pub(crate) fn pane_is_in_active_tab(&self, ws_idx: usize, pane_id: PaneId) -> bool {
-        let Some(active_ws_idx) = self.active else {
-            return false;
-        };
-        if active_ws_idx != ws_idx {
-            return false;
-        }
-        self.workspaces[ws_idx]
-            .find_tab_index_for_pane(pane_id)
-            .is_some_and(|tab_idx| tab_idx == self.workspaces[ws_idx].active_tab)
+    pub(crate) fn pane_is_focused(&self, ws_idx: usize, pane_id: PaneId) -> bool {
+        self.active == Some(ws_idx)
+            && self
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.focused_pane_id())
+                == Some(pane_id)
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
@@ -519,26 +539,33 @@ impl AppState {
         }
     }
 
-    pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
+    pub(crate) fn mark_focused_pane_seen(&mut self) -> bool {
         let Some(ws_idx) = self.active else {
             return false;
         };
-        let Some(tab) = self
+        let Some(pane_id) = self
             .workspaces
-            .get_mut(ws_idx)
-            .and_then(crate::workspace::Workspace::active_tab_mut)
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::focused_pane_id)
         else {
             return false;
         };
+        self.mark_pane_seen(ws_idx, pane_id)
+    }
 
-        let mut changed = false;
-        for pane in tab.panes.values_mut() {
-            if !pane.seen {
-                pane.seen = true;
-                changed = true;
-            }
+    pub(crate) fn mark_pane_seen(&mut self, ws_idx: usize, pane_id: PaneId) -> bool {
+        let Some(pane) = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|workspace| workspace.pane_state_mut(pane_id))
+        else {
+            return false;
+        };
+        if pane.seen {
+            return false;
         }
-        changed
+        pane.seen = true;
+        true
     }
 
     pub fn move_workspace(&mut self, source_idx: usize, insert_idx: usize) -> bool {
@@ -1817,7 +1844,7 @@ impl AppState {
         change: &EffectiveStateChange,
         suppress_completion: bool,
     ) -> Option<bool> {
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
+        let is_active_tab = self.pane_is_focused(ws_idx, pane_id);
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
         let pane = self.workspaces[ws_idx]
@@ -1851,7 +1878,7 @@ impl AppState {
     ) -> Option<AgentNotificationDelivery> {
         self.pending_agent_notifications.remove(&pane_id);
 
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
+        let is_active_tab = self.pane_is_focused(ws_idx, pane_id);
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
 
@@ -1938,7 +1965,7 @@ impl AppState {
             return None;
         }
 
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
+        let is_active_tab = self.pane_is_focused(ws_idx, pane_id);
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
         let sound = sound_for_toast_kind(kind, suppress_active_tab_notifications)
@@ -2707,14 +2734,62 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_marks_panes_seen() {
+    fn switch_workspace_marks_only_focused_pane_seen() {
         let mut state = app_with_workspaces(&["a", "b"]);
-        // Mark a pane in workspace 1 as unseen
-        let id = *state.workspaces[1].panes.keys().next().unwrap();
-        state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
+        let other = state.workspaces[1].focused_pane_id().unwrap();
+        let focused = state.workspaces[1].test_split(Direction::Horizontal);
+        state.workspaces[1].panes.get_mut(&focused).unwrap().seen = false;
+        state.workspaces[1].panes.get_mut(&other).unwrap().seen = false;
 
         state.switch_workspace(1);
-        assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+        assert!(state.workspaces[1].panes.get(&focused).unwrap().seen);
+        assert!(!state.workspaces[1].panes.get(&other).unwrap().seen);
+    }
+
+    #[test]
+    fn switch_tab_marks_only_focused_pane_seen() {
+        let mut state = app_with_workspaces(&["a"]);
+        let tab_idx = state.workspaces[0].test_add_tab(Some("second"));
+        state.workspaces[0].switch_tab(tab_idx);
+        let other = state.workspaces[0].focused_pane_id().unwrap();
+        let focused = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].panes.get_mut(&focused).unwrap().seen = false;
+        state.workspaces[0].panes.get_mut(&other).unwrap().seen = false;
+
+        state.workspaces[0].switch_tab(0);
+        state.workspaces[0].switch_tab(tab_idx);
+
+        assert!(state.workspaces[0].panes.get(&focused).unwrap().seen);
+        assert!(!state.workspaces[0].panes.get(&other).unwrap().seen);
+    }
+
+    #[test]
+    fn focusing_a_pane_marks_only_that_pane_seen() {
+        let mut state = app_with_workspaces(&["a"]);
+        let first = state.workspaces[0].focused_pane_id().unwrap();
+        let second = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].panes.get_mut(&first).unwrap().seen = false;
+        state.workspaces[0].panes.get_mut(&second).unwrap().seen = false;
+
+        assert!(state.focus_pane_in_workspace(0, first));
+        assert!(state.workspaces[0].panes.get(&first).unwrap().seen);
+        assert!(!state.workspaces[0].panes.get(&second).unwrap().seen);
+    }
+
+    #[test]
+    fn focusing_a_pane_in_another_tab_marks_only_the_target_seen() {
+        let mut state = app_with_workspaces(&["a"]);
+        let tab_idx = state.workspaces[0].test_add_tab(Some("second"));
+        state.workspaces[0].switch_tab(tab_idx);
+        let target = state.workspaces[0].focused_pane_id().unwrap();
+        let other = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].panes.get_mut(&target).unwrap().seen = false;
+        state.workspaces[0].panes.get_mut(&other).unwrap().seen = false;
+        state.workspaces[0].switch_tab(0);
+
+        assert!(state.focus_pane_in_workspace(0, target));
+        assert!(state.workspaces[0].panes.get(&target).unwrap().seen);
+        assert!(!state.workspaces[0].panes.get(&other).unwrap().seen);
     }
 
     #[test]
@@ -3033,6 +3108,38 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Idle);
         let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
         assert!(pane.seen);
+    }
+
+    #[test]
+    fn completion_in_unfocused_pane_of_active_tab_stays_unseen() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.outer_terminal_focus = Some(true);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let pane_id = state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+        let focused_pane = state.workspaces[0].test_split(Direction::Horizontal);
+        assert_ne!(pane_id, focused_pane);
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Idle);
+        assert!(!state.workspaces[0].panes[&pane_id].seen);
+        assert!(matches!(
+            state.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Finished)
+        ));
     }
 
     #[test]
@@ -4083,7 +4190,7 @@ mod tests {
             .publish_pane_process_exit_if_agent(pane_id, false)
             .expect("process exit update");
 
-        assert!(!state.pane_is_in_active_tab(update.ws_idx, pane_id));
+        assert!(!state.pane_is_focused(update.ws_idx, pane_id));
         assert_eq!(update.previous_state, AgentState::Working);
         assert_eq!(update.state, AgentState::Idle);
         assert_eq!(update.agent_label.as_deref(), Some("pi"));

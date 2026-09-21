@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::detect::AgentState;
 use crate::layout::PaneId;
+use crate::pane::PaneState;
 use crate::terminal::{TerminalId, TerminalState};
 
 use super::{Tab, Workspace};
@@ -17,7 +18,61 @@ pub struct PaneDetail {
     pub tokens: HashMap<String, String>,
 }
 
+fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
+    match (state, seen) {
+        (AgentState::Blocked, _) => 4,
+        (AgentState::Idle, false) => 3,
+        (AgentState::Working, _) => 2,
+        (AgentState::Idle, true) => 1,
+        (AgentState::Unknown, _) => 0,
+    }
+}
+
+fn aggregate_panes<'a>(
+    panes: impl Iterator<Item = &'a PaneState>,
+    terminals: &HashMap<TerminalId, TerminalState>,
+) -> (AgentState, bool, bool) {
+    let mut aggregate: Option<(AgentState, bool)> = None;
+    let mut all_seen = true;
+    let mut has_agent = false;
+
+    for pane in panes {
+        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+            continue;
+        };
+        if !terminal.is_agent_terminal() {
+            continue;
+        }
+
+        has_agent = true;
+        all_seen &= pane.seen;
+        let candidate = (terminal.state, pane.seen);
+        let replace = aggregate.is_none_or(|current| {
+            pane_attention_priority(candidate.0, candidate.1)
+                > pane_attention_priority(current.0, current.1)
+        });
+        if replace {
+            aggregate = Some(candidate);
+        }
+    }
+
+    let (state, _) = aggregate.unwrap_or((AgentState::Unknown, true));
+    (state, all_seen, has_agent)
+}
+
 impl Tab {
+    pub fn aggregate_state(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+    ) -> (AgentState, bool) {
+        let (state, all_seen, has_agent) = aggregate_panes(self.panes.values(), terminals);
+        if has_agent {
+            (state, all_seen)
+        } else {
+            (AgentState::Unknown, true)
+        }
+    }
+
     fn pane_details(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
@@ -47,31 +102,20 @@ impl Tab {
     }
 }
 
-fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Working, _) => 2,
-        (AgentState::Idle, true) => 1,
-        (AgentState::Unknown, _) => 0,
-    }
-}
-
 impl Workspace {
     pub fn aggregate_state(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
     ) -> (AgentState, bool) {
-        self.tabs
-            .iter()
-            .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| {
-                terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
-            })
-            .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
-            .unwrap_or((AgentState::Unknown, true))
+        let (state, all_seen, has_agent) = aggregate_panes(
+            self.tabs.iter().flat_map(|tab| tab.panes.values()),
+            terminals,
+        );
+        if has_agent {
+            (state, all_seen)
+        } else {
+            (AgentState::Unknown, true)
+        }
     }
 
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
@@ -118,9 +162,11 @@ mod tests {
             .unwrap();
         let mut terminals = HashMap::new();
         let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.detected_agent = Some(Agent::Codex);
         root_terminal.state = AgentState::Idle;
         terminals.insert(root_terminal.id.clone(), root_terminal);
         let mut second_terminal = terminal_for_pane(&ws, id2);
+        second_terminal.detected_agent = Some(Agent::Pi);
         second_terminal.state = AgentState::Working;
         terminals.insert(second_terminal.id.clone(), second_terminal);
 
@@ -142,9 +188,11 @@ mod tests {
             .unwrap();
         let mut terminals = HashMap::new();
         let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.detected_agent = Some(Agent::Codex);
         root_terminal.state = AgentState::Idle;
         terminals.insert(root_terminal.id.clone(), root_terminal);
         let mut second_terminal = terminal_for_pane(&ws, id2);
+        second_terminal.detected_agent = Some(Agent::Pi);
         second_terminal.state = AgentState::Working;
         terminals.insert(second_terminal.id.clone(), second_terminal);
         let root = ws.tabs[0].panes.get_mut(&root_id).unwrap();
@@ -154,6 +202,95 @@ mod tests {
 
         assert_eq!(state, AgentState::Idle);
         assert!(!seen);
+    }
+
+    #[test]
+    fn tab_seen_requires_every_agent_pane_to_be_seen() {
+        let mut ws = Workspace::test_new("test");
+        let second_id = ws.test_split(Direction::Horizontal);
+        let first_id = ws.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != second_id)
+            .copied()
+            .unwrap();
+        let mut terminals = HashMap::new();
+
+        let mut first_terminal = terminal_for_pane(&ws, first_id);
+        first_terminal.detected_agent = Some(Agent::Codex);
+        first_terminal.state = AgentState::Idle;
+        terminals.insert(first_terminal.id.clone(), first_terminal);
+        let mut second_terminal = terminal_for_pane(&ws, second_id);
+        second_terminal.detected_agent = Some(Agent::Pi);
+        second_terminal.state = AgentState::Idle;
+        terminals.insert(second_terminal.id.clone(), second_terminal);
+
+        ws.tabs[0].panes.get_mut(&first_id).unwrap().seen = true;
+        ws.tabs[0].panes.get_mut(&second_id).unwrap().seen = false;
+        assert_eq!(
+            ws.tabs[0].aggregate_state(&terminals),
+            (AgentState::Idle, false)
+        );
+
+        ws.tabs[0].panes.get_mut(&second_id).unwrap().seen = true;
+        assert_eq!(
+            ws.tabs[0].aggregate_state(&terminals),
+            (AgentState::Idle, true)
+        );
+    }
+
+    #[test]
+    fn no_agent_panes_do_not_make_tab_or_workspace_unseen() {
+        let mut ws = Workspace::test_new("test");
+        let second_id = ws.test_split(Direction::Horizontal);
+        let first_id = ws.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != second_id)
+            .copied()
+            .unwrap();
+        let mut terminals = HashMap::new();
+
+        let mut first_terminal = terminal_for_pane(&ws, first_id);
+        first_terminal.detected_agent = Some(Agent::Codex);
+        first_terminal.state = AgentState::Idle;
+        terminals.insert(first_terminal.id.clone(), first_terminal);
+        let mut second_terminal = terminal_for_pane(&ws, second_id);
+        second_terminal.state = AgentState::Idle;
+        terminals.insert(second_terminal.id.clone(), second_terminal);
+
+        ws.tabs[0].panes.get_mut(&first_id).unwrap().seen = true;
+        ws.tabs[0].panes.get_mut(&second_id).unwrap().seen = false;
+        assert_eq!(
+            ws.tabs[0].aggregate_state(&terminals),
+            (AgentState::Idle, true)
+        );
+        assert_eq!(ws.aggregate_state(&terminals), (AgentState::Idle, true));
+    }
+
+    #[test]
+    fn workspace_seen_requires_every_agent_tab_to_be_seen() {
+        let mut ws = Workspace::test_new("test");
+        let second_tab = ws.test_add_tab(Some("second"));
+        let first_id = ws.tabs[0].root_pane;
+        let second_id = ws.tabs[second_tab].root_pane;
+        let mut terminals = HashMap::new();
+
+        let mut first_terminal = terminal_for_pane(&ws, first_id);
+        first_terminal.detected_agent = Some(Agent::Codex);
+        first_terminal.state = AgentState::Idle;
+        terminals.insert(first_terminal.id.clone(), first_terminal);
+        let mut second_terminal = terminal_for_pane(&ws, second_id);
+        second_terminal.detected_agent = Some(Agent::Pi);
+        second_terminal.state = AgentState::Idle;
+        terminals.insert(second_terminal.id.clone(), second_terminal);
+
+        ws.tabs[0].panes.get_mut(&first_id).unwrap().seen = true;
+        ws.tabs[second_tab].panes.get_mut(&second_id).unwrap().seen = false;
+        assert_eq!(ws.aggregate_state(&terminals), (AgentState::Idle, false));
+
+        ws.tabs[second_tab].panes.get_mut(&second_id).unwrap().seen = true;
+        assert_eq!(ws.aggregate_state(&terminals), (AgentState::Idle, true));
     }
 
     #[test]

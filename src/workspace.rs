@@ -452,7 +452,8 @@ impl Workspace {
         if idx < self.tabs.len() {
             self.active_tab = idx;
             if let Some(tab) = self.tabs.get_mut(idx) {
-                for pane in tab.panes.values_mut() {
+                let focused_pane = tab.layout.focused();
+                if let Some(pane) = tab.panes.get_mut(&focused_pane) {
                     pane.seen = true;
                 }
             }
